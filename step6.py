@@ -1,13 +1,27 @@
 import asyncio
-import os
+import random
 from openai import OpenAI
-from agents import Agent, Runner, function_tool, WebSearchTool
+import numpy as np
+import os
 from dotenv import load_dotenv
 import requests
-import soundfile as sf
-import openai
+
+from agents import Agent, function_tool
+from agents.extensions.handoff_prompt import prompt_with_handoff_instructions
+from agents.voice import (
+    AudioInput,
+    SingleAgentVoiceWorkflow,
+    SingleAgentWorkflowCallbacks,
+    VoicePipeline,
+)
+
+from util import AudioPlayer, record_audio
 
 load_dotenv()
+
+client = OpenAI(
+        api_key=os.environ.get("OPENAI_API_KEY"),
+)
 
 # Load environment variables
 access_token = os.getenv("ACCESS_TOKEN")
@@ -81,52 +95,60 @@ def process_deal_stage(account_name: str, deal_name: str, deal_stage: str):
     else:
         print(f"❌ Account '{account_name}' not found")
 
-# Agents setup
-client = OpenAI(api_key=openai_api_key)
+
+
+@function_tool
+def get_weather(city: str) -> str:
+    """Get the weather for a given city."""
+    print(f"[debug] get_weather called with city: {city}")
+    choices = ["sunny", "cloudy", "rainy", "snowy"]
+    return f"The weather in {city} is {random.choice(choices)}."
+
+
 
 crm_agent = Agent(
-    name="Communicates with CRM",
+    name="CRM agent",
     handoff_description="Specialist agent for creating, reading, updating and deleting accounts and deals in Zoho CRM",
     instructions="You are integrated with a CRM system. Retrieve the account name, deal name and deal stage from the conversation and pass it to the tool.",
     tools=[process_deal_stage],
 )
 
-sales_coach_agent = Agent(
-    name="Provides Sales Coaching",
-    handoff_description="Specialist agent for sales coaching",
-    instructions="You are a Specialist AI agent for sales coaching. Focus on refining messaging, objection handling, \
-    and closing techniques. Deliver concise, actionable, and context-aware coaching to help reps consistently improve performance.",
-    tools=[WebSearchTool(client, "https://www.salescoach.com")],
+agent = Agent(
+    name="Assistant",
+    instructions=prompt_with_handoff_instructions(
+        "You're speaking to a human, so be polite and concise. If the user talks about updating a sales deal, handoff to the crm agent.",
+    ),
+    model="gpt-4o-mini",
+    handoffs=[crm_agent],
+    tools=[get_weather],
 )
 
-triage_agent = Agent(
-    name="Triage Agent",
-    instructions="You determine which agent to use based on the user's question, if the question is about updating \
-    a deal use the CRM agent, if the question is about sales coaching use the Sales Coach agent",
-    handoffs=[crm_agent, sales_coach_agent]
-)
 
-# OpenAI Whisper integration for audio transcription
-async def transcribe_audio(file_path):
-    print("Transcribing audio...")
-    with open(file_path, "rb") as audio_file:
-        response = client.audio.transcriptions.create(
-            model="gpt-4o-transcribe",
-            file=audio_file
-        )
-    return response.text
+class WorkflowCallbacks(SingleAgentWorkflowCallbacks):
+    def on_run(self, workflow: SingleAgentVoiceWorkflow, transcription: str) -> None:
+        print(f"[debug] on_run called with transcription: {transcription}")
 
-# Main function to handle audio input
-async def main(audio_file_path):
-    # Transcribe the audio file
-    user_query = await transcribe_audio(audio_file_path)
-    print(f"Transcribed Query: {user_query}")
 
-    # Pass the transcribed query to the triage agent
-    result = await Runner.run(triage_agent, user_query)
-    print(result.final_output)
+async def main():
+    pipeline = VoicePipeline(
+        workflow=SingleAgentVoiceWorkflow(agent, callbacks=WorkflowCallbacks())
+    )
+
+    audio_input = AudioInput(buffer=record_audio())
+
+    result = await pipeline.run(audio_input)
+
+    with AudioPlayer() as player:
+        async for event in result.stream():
+            if event.type == "voice_stream_event_audio":
+                player.add_audio(event.data)
+                print("Received audio")
+            elif event.type == "voice_stream_event_lifecycle":
+                print(f"Received lifecycle event: {event.event}")
+
+        # Add 1 second of silence to the end of the stream to avoid cutting off the last audio.
+        player.add_audio(np.zeros(24000 * 1, dtype=np.int16))
+
 
 if __name__ == "__main__":
-    # Example usage: Pass the path to the audio file
-    audio_file = "sales.mp3"  # Replace with the actual path to your audio file
-    asyncio.run(main(audio_file))
+    asyncio.run(main())
