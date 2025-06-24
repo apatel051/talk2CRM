@@ -1,0 +1,8 @@
+python-dotenv
+requests
+openai-agents 
+openai-agents[voice]
+openai
+numpy
+sounddevice 
+windows-curses
